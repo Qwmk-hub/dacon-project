@@ -6,16 +6,22 @@ importlib.reload(Alpha)
 from Alpha import merge_df, completed
 
 import numpy as np
+import optuna
 
 from catboost import CatBoostClassifier, Pool
 from sklearn.model_selection import RepeatedStratifiedKFold
 from sklearn.preprocessing import MinMaxScaler
+from sklearn.model_selection import train_test_split
+from optuna.samplers import TPESampler
+from sklearn.model_selection import KFold, StratifiedKFold
+from sklearn.metrics import f1_score
+from sklearn.metrics import classification_report
 
 # --------------------
 # Load
 # --------------------
-train_raw = pd.read_csv("/Users/parksung-cheol/Desktop/dacon-project/data/raw/train.csv")
-test_raw  = pd.read_csv("/Users/parksung-cheol/Desktop/dacon-project/data/raw/test.csv")
+train_raw = pd.read_csv("C:\\Users\\solba\\dacon-project\\data\\raw\\train.csv")
+test_raw  = pd.read_csv("C:\\Users\\solba\\dacon-project\\data\\raw\\test.csv")
 
 train_df = merge_df(train_raw)
 test_df  = merge_df(test_raw)
@@ -24,9 +30,14 @@ train_df = completed(train_raw, train_df)
 train_df = train_df.sort_values("ID").reset_index(drop=True)
 test_df  = test_df.sort_values("ID").reset_index(drop=True)
 
-# --------------------
-# Columns
-# --------------------
+total_df1 = train_df.drop(columns=["ID", "completed"])
+total_df2 = test_df.drop(columns=["ID"])
+
+train_data = total_df1
+test_data = total_df2
+
+target = train_df["completed"]
+
 cat_cols = [
     "school1","job","nationality","High Tech","Data Friendly","Others",
     "hope_for_group","desired_career_path",
@@ -34,155 +45,82 @@ cat_cols = [
     "incumbents_lecture_type","incumbents_lecture_scale",
 ]
 num_cols = ["count","time_input","want_count"]
-x_cols   = cat_cols + num_cols
-target_col = "completed"
 
-# --------------------
-# dtype fix (중요)
-# - CatBoost에 cat_features로 넘길 컬럼은 문자열/카테고리로 확실히 만들어주기
-# --------------------
-for c in cat_cols:
-    train_df[c] = train_df[c].astype(str)
-    test_df[c]  = test_df[c].astype(str)
+for col in num_cols:
+    q3 = train_data[col].quantile(0.75)
+    q1 = train_data[col].quantile(0.25)
+    iqr = q3 - q1
+    outlier_idx = train_data[col][(train_data[col]<q1 - 1.5*iqr)|(train_data[col]>q3 + 1.5*iqr)].index
+    train_data.drop(outlier_idx, inplace=True)
+    target.drop(outlier_idx, inplace=True)
 
-# --------------------
-# CV (중요: Stratified)
-# --------------------
-rskf = RepeatedStratifiedKFold(n_splits=5, n_repeats=1, random_state=42)
+column_names_to_normalize = num_cols
+x = train_data[column_names_to_normalize].values
+scaler = MinMaxScaler()
+x_scaled = scaler.fit_transform(x)
+train_data_temp = pd.DataFrame(x_scaled, columns = column_names_to_normalize, index = train_data.index)
+train_data[column_names_to_normalize] = train_data_temp
 
-models = []
-oof_pred = np.zeros(len(train_df), dtype=float)
+column_names_to_normalize = num_cols
+x = test_data[column_names_to_normalize].values
 
-for fold, (tr_idx, va_idx) in enumerate(rskf.split(train_df[x_cols], train_df[target_col]), 1):
-    X_tr = train_df.loc[tr_idx, x_cols].copy()
-    y_tr = train_df.loc[tr_idx, target_col].astype(int).values
-    X_va = train_df.loc[va_idx, x_cols].copy()
-    y_va = train_df.loc[va_idx, target_col].astype(int).values
+test_scaled =  scaler.transform(x)
+test_temp = pd.DataFrame(test_scaled, columns = column_names_to_normalize, index = test_data.index)
+test_data[column_names_to_normalize] = test_temp
 
-    X_te = test_df[x_cols].copy()
+X_train, X_validation, y_train, y_validation = train_test_split(train_data, target, train_size = 0.7, random_state = 42)
 
-    # --------------------
-    # Scaling (중요: 누수 방지)
-    # - fold의 train으로만 fit
-    # - valid/test는 transform만
-    # --------------------
-    scaler = MinMaxScaler()
-    X_tr[num_cols] = scaler.fit_transform(X_tr[num_cols])
-    X_va[num_cols] = scaler.transform(X_va[num_cols])
-    X_te[num_cols] = scaler.transform(X_te[num_cols])
+train_pool  = Pool(X_train, y_train, cat_features=cat_cols)
+eval_pool = Pool(X_validation, y_validation, cat_features=cat_cols)
+test_pool = Pool(data = test_data, cat_features=cat_cols)
 
-    params = dict(
-        loss_function="Logloss",
-        eval_metric="Logloss",
-        iterations=1000,
-        learning_rate=0.02,
-        depth=5,
-        l2_leaf_reg=5.0,
-        min_data_in_leaf=20,      # (너 주석이랑 맞춰서 20 권장, 더 빡세게면 30~50)
-        rsm=0.8,
-        subsample=0.8,
-        random_seed=42,
-        verbose=100,
-        allow_writing_files=False,
-        auto_class_weights="Balanced",
-    )
+sampler = TPESampler(seed = 10)
 
-    tr_pool = Pool(X_tr, y_tr, cat_features=cat_cols)  # cat_features는 "컬럼명 리스트"로
-    va_pool = Pool(X_va, y_va, cat_features=cat_cols)
-    te_pool = Pool(X_te, cat_features=cat_cols)
+# 함수 정의
+def objective(trial):
 
-    model = CatBoostClassifier(**params)
-    model.fit(
-        tr_pool,
-        eval_set=va_pool,
-        use_best_model=True,
-        early_stopping_rounds=100,  # od_*랑 중복 피하려고 params에서는 od_* 제거
-    )
+    param = {
+      "random_state" : 42,
+      'learning_rate' : trial.suggest_uniform('learning_rate', 0.01, 0.2),
+    } 
+    model = CatBoostClassifier(**param)
+    f1_list = []
+    kf = KFold(n_splits=10)
+    for tr_index,val_index in kf.split(train_data):
+        X_train, y_train = train_data.iloc[tr_index], target.iloc[tr_index]
+        X_valid , y_valid = train_data.iloc[val_index], target.iloc[val_index]
+        model = model.fit(X_train,y_train, eval_set=[(X_train,y_train),(X_valid,y_valid)],
+                           verbose=False, early_stopping_rounds=35)                         
+        f1_list.append(f1_score(y_valid, model.predict(X_valid),average='macro'))
+    return np.mean(f1_list)
 
-    # OOF
-    oof_pred[va_idx] = model.predict_proba(va_pool)[:, 1]
-    models.append(model)
+optuna_cbrm = optuna.create_study(direction="maximize", sampler=sampler)
+optuna_cbrm.optimize(objective, n_trials = 30)
 
-    print(f"[Fold {fold}] best_iter={model.get_best_iteration()} | best_score={model.get_best_score()}")
+cbrm_trial = optuna_cbrm.best_trial
+cbrm_trial_params = cbrm_trial.params
 
-# 여기서 oof_pred로 threshold 튜닝(F1 최대) 하면 됨
-from sklearn.metrics import f1_score, roc_auc_score, precision_score, recall_score, accuracy_score
+cbrm_trial_params
 
-# ====================
-# 1) OOF 성능 확인 (AUC + threshold 스캔으로 F1 최대 찾기)
-# ====================
-y_true = train_df[target_col].astype(int).values
+#Optuna에서 가져온 최적의 파라미터들로 모델 학습
+params = {
+          'learning_rate': 0.1550157115572994,
+          'eval_metric':'AUC',
+          'early_stopping_rounds':50,
+          'use_best_model': True,
+          'random_seed': 42,
+          'auto_class_weights':'Balanced',
+          'verbose':200}
+model = CatBoostClassifier(**params)
+model.fit(train_pool, eval_set=eval_pool,use_best_model=True)
 
-oof_auc = roc_auc_score(y_true, oof_pred)
-print(f"\nOOF AUC: {oof_auc:.4f}")
+pred = model.predict(eval_pool)
+print(classification_report(y_validation,pred,digits=5))
 
-best_t, best_f1 = None, -1
-best_metrics = None
+# ----------------제출용-----------------------------
+mypredictions = model.predict(test_data)
 
-# threshold는 0.05~0.95 정도만 봐도 충분 (너무 극단값은 보통 의미 없음)
-for t in np.linspace(0.05, 0.95, 91):
-    y_hat = (oof_pred >= t).astype(int)
-    f1 = f1_score(y_true, y_hat)
-    if f1 > best_f1:
-        best_f1 = f1
-        best_t = float(t)
-        best_metrics = dict(
-            acc=accuracy_score(y_true, y_hat),
-            precision=precision_score(y_true, y_hat, zero_division=0),
-            recall=recall_score(y_true, y_hat, zero_division=0),
-        )
+ss = pd.read_csv('C:\\Users\\solba\\dacon-project\\result\\sample_submission.csv',header=0)
+ss['completed'] = mypredictions
 
-print(
-    f"Best F1={best_f1:.4f} at t={best_t:.3f} | "
-    f"ACC={best_metrics['acc']:.4f} | "
-    f"P={best_metrics['precision']:.4f} | "
-    f"R={best_metrics['recall']:.4f}"
-)
-
-# ====================
-# 2) test 예측 (폴드 모델 앙상블 평균)
-#    - 각 fold에서 만든 model은 "그 fold의 스케일"로 학습됨
-#    - 그래서 test도 fold마다 scaler로 변환해서 예측해야 정합성이 맞음
-#    - 위 루프에서 X_te를 만들긴 했지만, 밖으로 저장을 안 했으니
-#      여기서 "fold별로 다시" scaler까지 재현해서 평균내는 게 안전함
-# ====================
-test_pred = np.zeros(len(test_df), dtype=float)
-
-for fold, (tr_idx, va_idx) in enumerate(rskf.split(train_df[x_cols], train_df[target_col]), 1):
-    # fold별 scaler 재현
-    X_tr = train_df.loc[tr_idx, x_cols].copy()
-    X_te = test_df[x_cols].copy()
-
-    scaler = MinMaxScaler()
-    X_tr[num_cols] = scaler.fit_transform(X_tr[num_cols])
-    X_te[num_cols] = scaler.transform(X_te[num_cols])
-
-    te_pool = Pool(X_te, cat_features=cat_cols)
-
-    # fold 순서대로 models에 들어있다고 가정
-    model = models[fold - 1]
-    test_pred += model.predict_proba(te_pool)[:, 1] / len(models)
-
-# ====================
-# 3) 최종 threshold(best_t)로 0/1 변환 & 제출 파일 생성
-# ====================
-test_label = (test_pred >= best_t).astype(int)
-
-# 보통 dacon은 sample_submission.csv를 제공함
-# 없으면 ID + completed로 만들면 됨
-try:
-    sub = pd.read_csv("/Users/parksung-cheol/Desktop/dacon-project/data/raw/sample_submission.csv")
-    # 컬럼명이 completed가 아닐 수도 있으니 안전하게 처리
-    if "completed" in sub.columns:
-        sub["completed"] = test_label
-    else:
-        # 마지막 컬럼을 타겟으로 치환 (대회마다 다름)
-        sub.iloc[:, -1] = test_label
-except FileNotFoundError:
-    sub = pd.DataFrame({"ID": test_df["ID"], "completed": test_label})
-
-out_path = "/Users/parksung-cheol/Desktop/dacon-project/submission_catboost.csv"
-sub.to_csv(out_path, index=False)
-
-print(f"\nSaved submission: {out_path}")
-print("Pred positive rate:", test_label.mean())
+ss.to_csv('My_submission.csv',index=False)
